@@ -58,6 +58,14 @@ static float EmuToPx(i64 emu, float zoom) {
     return (float)emu / kEmuPerInch * kRenderDpi * zoom;
 }
 
+// Convert font size in points to pixels at our reference 96 DPI.
+// We use UnitPixel for fonts (not UnitPoint) because UnitPoint uses the
+// system DPI which may differ from our coordinate system's 96 DPI,
+// causing fonts to appear too large on high-DPI displays.
+static float PtToPx(float pt) {
+    return pt * (kRenderDpi / 72.0f);
+}
+
 // parse a 6-hex-digit color string "RRGGBB" -> COLORREF
 static COLORREF ParseHexColor(const char* s, size_t len) {
     if (len < 6) {
@@ -1140,9 +1148,77 @@ static void FinalizeShape(PptxShape* shape, PptxSlide* slide, const Vec<GroupTra
     }
 }
 
+// Extract background color from a slide layout or master XML.
+static COLORREF ExtractBgColor(MultiFormatArchive* archive, const char* xmlPath, const PptxTheme* theme) {
+    ByteSlice data = archive->GetFileDataByName(xmlPath);
+    if (!data) {
+        return (COLORREF)-1;
+    }
+    HtmlPullParser parser(data);
+    HtmlToken* tok;
+    bool inBg = false;
+    bool inBgPr = false;
+    bool inBgRef = false;
+    while ((tok = parser.Next()) != nullptr) {
+        if (tok->IsError()) {
+            break;
+        }
+        if (tok->IsEndTag()) {
+            if (TagIs(tok, "bg")) {
+                inBg = false;
+            }
+            if (TagIs(tok, "bgPr")) {
+                inBgPr = false;
+            }
+            if (TagIs(tok, "bgRef")) {
+                inBgRef = false;
+            }
+            continue;
+        }
+        if (!tok->IsStartTag() && !tok->IsEmptyElementEndTag()) {
+            continue;
+        }
+        if (TagIs(tok, "bg")) {
+            inBg = true;
+        } else if (inBg && TagIs(tok, "bgPr")) {
+            inBgPr = true;
+        } else if (inBg && TagIs(tok, "bgRef")) {
+            inBgRef = true;
+        } else if (inBgPr && TagIs(tok, "solidFill")) {
+            COLORREF c = ParseColorBlock(parser, theme);
+            data.Free();
+            return c;
+        } else if ((inBgRef || inBgPr) && TagIs(tok, "srgbClr")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v) {
+                COLORREF c = ParseHexColor(v->val, v->valLen);
+                data.Free();
+                return c;
+            }
+        } else if ((inBgRef || inBgPr) && TagIs(tok, "schemeClr")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v && theme) {
+                COLORREF c = theme->GetSchemeColor(v->val, v->valLen);
+                data.Free();
+                return c;
+            }
+        } else if ((inBgRef || inBgPr) && TagIs(tok, "sysClr")) {
+            AttrInfo* lc = tok->GetAttrByName("lastClr");
+            if (lc) {
+                COLORREF c = ParseHexColor(lc->val, lc->valLen);
+                data.Free();
+                return c;
+            }
+        }
+    }
+    data.Free();
+    return (COLORREF)-1;
+}
+
 // Build a table of placeholder positions by loading the slide's layout and master.
-static void BuildPlaceholderTable(MultiFormatArchive* archive, const char* slideZipPath,
-                                  Vec<PlaceholderPos*>& phTable) {
+// Also extracts the inherited background color from layout/master if available.
+static void BuildPlaceholderTable(MultiFormatArchive* archive, const char* slideZipPath, Vec<PlaceholderPos*>& phTable,
+                                  const PptxTheme* theme = nullptr, COLORREF* outInheritedBg = nullptr) {
     Vec<char*> slideRelRIds, slideRelPaths;
     ParseSlideRels(archive, slideZipPath, slideRelRIds, slideRelPaths);
 
@@ -1154,6 +1230,7 @@ static void BuildPlaceholderTable(MultiFormatArchive* archive, const char* slide
             break;
         }
     }
+    const char* masterPath = nullptr;
     if (layoutPath) {
         ExtractPlaceholderPositions(archive, layoutPath, phTable);
 
@@ -1162,9 +1239,18 @@ static void BuildPlaceholderTable(MultiFormatArchive* archive, const char* slide
         ParseSlideRels(archive, layoutPath, layoutRelRIds, layoutRelPaths);
         for (int i = 0; i < layoutRelPaths.Size(); i++) {
             if (str::Find(layoutRelPaths[i], "slideMaster")) {
-                ExtractPlaceholderPositions(archive, layoutRelPaths[i], phTable);
+                masterPath = layoutRelPaths[i];
+                ExtractPlaceholderPositions(archive, masterPath, phTable);
                 break;
             }
+        }
+        // Extract inherited background: try layout first, then master
+        if (outInheritedBg) {
+            COLORREF bg = ExtractBgColor(archive, layoutPath, theme);
+            if (bg == (COLORREF)-1 && masterPath) {
+                bg = ExtractBgColor(archive, masterPath, theme);
+            }
+            *outInheritedBg = bg;
         }
         for (char* p : layoutRelRIds) {
             str::Free(p);
@@ -1190,9 +1276,10 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
     Vec<char*> relRIds, relPaths;
     ParseSlideRels(archive, slideZipPath, relRIds, relPaths);
 
-    // Build placeholder position table from layout/master
+    // Build placeholder position table from layout/master + inherited background
     Vec<PlaceholderPos*> phTable;
-    BuildPlaceholderTable(archive, slideZipPath, phTable);
+    COLORREF inheritedBg = (COLORREF)-1;
+    BuildPlaceholderTable(archive, slideZipPath, phTable, theme, &inheritedBg);
 
     auto* slide = new PptxSlide();
     PptxShape* curShape = nullptr;
@@ -1222,6 +1309,18 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
     // p:graphicFrame: OLE objects / charts — extract image preview if present
     bool inGraphicFrame = false;
     PptxShape* gfShape = nullptr;
+
+    // Table parsing state
+    bool inTable = false;
+    bool inTableRow = false;
+    bool inTableCell = false;
+    bool inTcPr = false;
+    Vec<i64> tableColWidths;
+    i64 tableOffX = 0, tableOffY = 0;
+    i64 tableCurRowH = 0;
+    i64 tableCurY = 0;
+    int tableCurCol = 0;
+    int tableCellGridSpan = 1;
 
     HtmlPullParser parser(data);
     HtmlToken* tok;
@@ -1294,6 +1393,30 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
                 inBg = false;
             } else if (TagIs(tok, "bgPr")) {
                 inBgPr = false;
+            } else if (inTable && TagIs(tok, "tc")) {
+                // Finalize table cell shape
+                if (curShape) {
+                    slide->shapes.Append(curShape);
+                    curShape = nullptr;
+                }
+                curPara = nullptr;
+                curRun = nullptr;
+                inTxBody = false;
+                inSpPr = false;
+                inTcPr = false;
+                inTableCell = false;
+                // Advance column by gridSpan
+                tableCurCol += tableCellGridSpan;
+                tableCellGridSpan = 1;
+            } else if (inTable && TagIs(tok, "tcPr")) {
+                inTcPr = false;
+            } else if (inTable && TagIs(tok, "tr")) {
+                inTableRow = false;
+                tableCurY += tableCurRowH;
+                tableCurCol = 0;
+            } else if (TagIs(tok, "tbl")) {
+                inTable = false;
+                tableColWidths.Reset();
             } else if (TagIs(tok, "graphicFrame")) {
                 // Finalize OLE/chart graphic frame as image shape
                 if (gfShape) {
@@ -1305,6 +1428,8 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
                     gfShape = nullptr;
                 }
                 inGraphicFrame = false;
+                inTable = false;
+                tableColWidths.Reset();
             }
             continue;
         }
@@ -1406,7 +1531,7 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
         } else if (inGraphicFrame && gfShape && TagIs(tok, "ext") && !curShape) {
             gfShape->extCx = ParseAttrI64(tok->GetAttrByNameNS("cx", nullptr));
             gfShape->extCy = ParseAttrI64(tok->GetAttrByNameNS("cy", nullptr));
-        } else if (inGraphicFrame && gfShape && TagIs(tok, "blip")) {
+        } else if (inGraphicFrame && gfShape && TagIs(tok, "blip") && !inTable) {
             // OLE object image preview (inside p:oleObj/p:pic/p:blipFill/a:blip)
             AttrInfo* embed = tok->GetAttrByNameNS("embed", nullptr);
             if (embed && embed->valLen > 0) {
@@ -1416,6 +1541,83 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
                     gfShape->imagePath = str::Dup(imgPath);
                 }
             }
+        }
+
+        // ---- Table inside graphicFrame ----
+        else if (inGraphicFrame && TagIs(tok, "tbl")) {
+            inTable = true;
+            tableColWidths.Reset();
+            tableOffX = gfShape ? gfShape->offX : 0;
+            tableOffY = gfShape ? gfShape->offY : 0;
+            tableCurY = 0;
+            tableCurCol = 0;
+            // We found a table, so the gfShape is not an image preview
+            if (gfShape) {
+                delete gfShape;
+                gfShape = nullptr;
+            }
+        } else if (inTable && TagIs(tok, "gridCol")) {
+            AttrInfo* w = tok->GetAttrByName("w");
+            if (w) {
+                tableColWidths.Append(ParseAttrI64(w));
+            }
+        } else if (inTable && TagIs(tok, "tr")) {
+            inTableRow = true;
+            AttrInfo* h = tok->GetAttrByName("h");
+            tableCurRowH = h ? ParseAttrI64(h) : 370840; // default ~0.4"
+            tableCurCol = 0;
+        } else if (inTable && inTableRow && TagIs(tok, "tc")) {
+            inTableCell = true;
+            inTcPr = false;
+            // Check for hMerge/vMerge (skip merged continuation cells)
+            AttrInfo* hMerge = tok->GetAttrByName("hMerge");
+            AttrInfo* vMerge = tok->GetAttrByName("vMerge");
+            bool isMerged = (hMerge && ParseAttrBool(hMerge)) || (vMerge && ParseAttrBool(vMerge));
+            // Check gridSpan
+            AttrInfo* gs = tok->GetAttrByName("gridSpan");
+            tableCellGridSpan = gs ? (int)ParseAttrI64(gs) : 1;
+            if (tableCellGridSpan < 1) {
+                tableCellGridSpan = 1;
+            }
+
+            // Calculate cell position from grid
+            i64 cellX = tableOffX;
+            for (int ci = 0; ci < tableCurCol && ci < tableColWidths.Size(); ci++) {
+                cellX += tableColWidths[ci];
+            }
+            i64 cellW = 0;
+            for (int ci = tableCurCol; ci < tableCurCol + tableCellGridSpan && ci < tableColWidths.Size(); ci++) {
+                cellW += tableColWidths[ci];
+            }
+            i64 cellY = tableOffY + tableCurY;
+            i64 cellH = tableCurRowH;
+
+            if (!isMerged && cellW > 0 && cellH > 0) {
+                curShape = new PptxShape();
+                curShape->type = PptxShapeType::Text;
+                curShape->offX = cellX;
+                curShape->offY = cellY;
+                curShape->extCx = cellW;
+                curShape->extCy = cellH;
+                curShape->hasExplicitXfrm = true;
+                // Default thin border for table cells
+                curShape->borderWidth = 12700.0f; // ~1pt
+                curShape->borderColor = RGB(0, 0, 0);
+                // Default cell insets (smaller than shape defaults)
+                curShape->bodyProps.lIns = 45720; // ~0.05"
+                curShape->bodyProps.rIns = 45720;
+                curShape->bodyProps.tIns = 22860;
+                curShape->bodyProps.bIns = 22860;
+            }
+        } else if (inTable && inTableCell && TagIs(tok, "tcPr")) {
+            inTcPr = true;
+        } else if (inTable && inTcPr && curShape && TagIs(tok, "solidFill")) {
+            COLORREF c = ParseColorBlock(parser, theme);
+            if (c != (COLORREF)-1) {
+                curShape->fillColor = c;
+            }
+        } else if (inTable && inTcPr && curShape && TagIs(tok, "noFill")) {
+            curShape->fillColor = (COLORREF)-1;
         }
 
         // Placeholder tag — record ph idx/type on current shape
@@ -1588,6 +1790,12 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
         str::Free(p);
     }
     DeleteVecMembers(phTable);
+
+    // Apply inherited background from layout/master if slide doesn't define its own
+    if (slide->bgColor == (COLORREF)-1 && !slide->bgImagePath && inheritedBg != (COLORREF)-1) {
+        slide->bgColor = inheritedBg;
+    }
+
     return slide;
 }
 
@@ -2279,7 +2487,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                     int style = (run->bold || para->props.defBold ? FontStyleBold : FontStyleRegular) |
                                 (run->italic || para->props.defItalic ? FontStyleItalic : 0);
                     TempWStr fn = ToWStrTemp(ResolveFont(run->fontName));
-                    Font font(fn ? fn : L"Calibri", fs, style, UnitPoint);
+                    Font font(fn ? fn : L"Calibri", PtToPx(fs), style, UnitPixel);
                     Gdiplus::RectF box;
                     g.MeasureString(L"Mg", -1, &font, Gdiplus::RectF(0, 0, 9999, 9999), &sfNoWrap, &box);
                     if (box.Height > paraLineH) {
@@ -2343,7 +2551,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 int style = ((run->bold || pp.defBold) ? FontStyleBold : FontStyleRegular) |
                             ((run->italic || pp.defItalic) ? FontStyleItalic : 0);
                 TempWStr fn2 = ToWStrTemp(ResolveFont(run->fontName));
-                Font font(fn2 ? fn2 : L"Calibri", fs, style, UnitPoint);
+                Font font(fn2 ? fn2 : L"Calibri", PtToPx(fs), style, UnitPixel);
                 Gdiplus::RectF box;
                 g.MeasureString(L"Mg", -1, &font, Gdiplus::RectF(0, 0, 9999, 9999), &sfNoWrap, &box);
                 if (box.Height > paraLineH) {
@@ -2354,7 +2562,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 // Empty paragraph: use default/inherited size
                 float fs = (pp.defFontSize > 0 ? pp.defFontSize : 12.0f) * zoom;
                 TempWStr efn = ToWStrTemp(ResolveFont(nullptr));
-                Font ef(efn ? efn : L"Calibri", fs, FontStyleRegular, UnitPoint);
+                Font ef(efn ? efn : L"Calibri", PtToPx(fs), FontStyleRegular, UnitPixel);
                 Gdiplus::RectF box;
                 g.MeasureString(L"Mg", -1, &ef, Gdiplus::RectF(0, 0, 9999, 9999), &sfNoWrap, &box);
                 paraLineH = box.Height > 0 ? box.Height : fs * (96.0f / 72.0f);
@@ -2397,7 +2605,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 }
                 float bFs = defFs;
                 TempWStr bfn = ToWStrTemp(ResolveFont(nullptr));
-                Font bFont(bfn ? bfn : L"Calibri", bFs, FontStyleRegular, UnitPoint);
+                Font bFont(bfn ? bfn : L"Calibri", PtToPx(bFs), FontStyleRegular, UnitPixel);
                 SolidBrush bBrush(Color(GetRValue(bulletColor), GetGValue(bulletColor), GetBValue(bulletColor)));
 
                 char bulletBuf[32] = {0};
@@ -2464,7 +2672,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 const char* fontNameU8 = ResolveFont(run->fontName);
                 TempWStr fontNameW = ToWStrTemp(fontNameU8);
                 const wchar_t* fontW = fontNameW ? fontNameW : L"Calibri";
-                Font* font = new Font(fontW, fs, style, UnitPoint);
+                Font* font = new Font(fontW, PtToPx(fs), style, UnitPixel);
                 paraFonts.Append(font);
                 COLORREF rc = EffectiveColor(run, para);
 
