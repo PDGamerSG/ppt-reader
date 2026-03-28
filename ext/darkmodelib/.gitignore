@@ -1,0 +1,46 @@
+# Dot Files/Folder
+.*
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Binary version of the resource script file
+*.aps
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Folders
+*.vscode
+
+**/build
+
+# Other
+*.vcxproj.user

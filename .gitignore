@@ -1,0 +1,51 @@
+*.suo
+*.aps
+*.opensdf
+*.sdf
+*.vspx
+*.vcxproj.user
+*.cov
+out.txt
+out/
+mupdf/generated/
+.vs/
+.vscode/db/
+.vscode/ipch/
+# src/utils/BuildConfig.h
+artifacts/
+.idea/
+src/.vscode
+tools/pdfjs/coverage/
+cppcheck.out.txt
+clangtidy.out.txt
+node_modules
+
+# https://stackoverflow.com/questions/10755655/git-ignore-tracked-files
+# git update-index --assume-unchanged .\docs\manual.dat    : stop tracking changes
+# git update-index --no-assume-unchanged .\docs\manual.dat : re-start tracking changes
+# must be done in every checkout
+#docs/manual.dat
+
+.claude/settings.local.json
+pipe-preview-results
+refer from these projects/
+*.obj
+build_full.bat
+do_build.bat
+compile_out.txt
+compile_pptx_test.bat
+co_stderr.txt
+co_stdout.txt
+co2_stderr.txt
+co2_stdout.txt
+spec.md
+ailog.txt
+nul
+docs/scratch.txt
+bin/zopflipng.exe
+
+docs-www/
+*.pdf
+*.cbr
+*.cbz
+translations/translations.txt.lzsa
