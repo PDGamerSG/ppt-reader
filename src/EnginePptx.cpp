@@ -206,16 +206,68 @@ struct PptxTheme {
     }
 };
 
+// Per-level text style (from slide master <p:txStyles>)
+struct PptxLevelStyle {
+    float fontSize = 0.0f;
+    COLORREF color = (COLORREF)-1;
+    bool bold = false;
+    bool italic = false;
+    char* fontName = nullptr;
+    i64 marL = -1;
+    i64 indent = 0;
+    bool hasBullet = false;
+    bool bulletIsNone = false;
+    char* bulletChar = nullptr;
+    char* bulletFont = nullptr;
+    COLORREF bulletColor = (COLORREF)-1;
+    float bulletSzPct = 0.0f; // bullet size as % of text (0=same)
+
+    ~PptxLevelStyle() {
+        str::Free(fontName);
+        str::Free(bulletChar);
+        str::Free(bulletFont);
+    }
+};
+
+// Text styles from slide master (<p:txStyles>)
+struct PptxTxStyles {
+    PptxLevelStyle titleLevels[9]; // from <p:titleStyle>
+    PptxLevelStyle bodyLevels[9];  // from <p:bodyStyle>
+    PptxLevelStyle otherLevels[9]; // from <p:otherStyle>
+
+    const PptxLevelStyle* GetLevel(const char* phType, int lvl) const {
+        if (lvl < 0) {
+            lvl = 0;
+        }
+        if (lvl > 8) {
+            lvl = 8;
+        }
+        if (phType) {
+            if (str::EqI(phType, "title") || str::EqI(phType, "ctrTitle")) {
+                return &titleLevels[lvl];
+            }
+            if (str::EqI(phType, "subTitle") || str::EqI(phType, "body") || str::EqI(phType, "obj") ||
+                str::EqI(phType, "clipArt") || str::EqI(phType, "tbl") || str::EqI(phType, "chart") ||
+                str::EqI(phType, "dgm") || str::EqI(phType, "media")) {
+                return &bodyLevels[lvl];
+            }
+        }
+        return &otherLevels[lvl];
+    }
+};
+
 // Paragraph-level properties
 struct PptxParaProps {
-    int algn = -1;         // -1=inherit, 0=left, 1=center, 2=right, 3=justify
-    i64 marL = -1;         // left margin EMU (-1=inherit)
-    i64 indent = 0;        // first-line indent EMU (negative=hanging)
-    int lvl = 0;           // outline level 0-8
-    float lnSpcPct = 0.0f; // line spacing % (0=inherit/100%)
-    float lnSpcPts = 0.0f; // line spacing absolute in points (0=use pct)
-    float spcBefPt = 0.0f; // space before in points
-    float spcAftPt = 0.0f; // space after in points
+    int algn = -1;          // -1=inherit, 0=left, 1=center, 2=right, 3=justify
+    i64 marL = -1;          // left margin EMU (-1=inherit)
+    i64 indent = 0;         // first-line indent EMU (negative=hanging)
+    int lvl = 0;            // outline level 0-8
+    float lnSpcPct = 0.0f;  // line spacing % (0=inherit/100%)
+    float lnSpcPts = 0.0f;  // line spacing absolute in points (0=use pct)
+    float spcBefPt = 0.0f;  // space before in points
+    float spcAftPt = 0.0f;  // space after in points
+    float spcBefPct = 0.0f; // space before as % of line (0=use pt)
+    float spcAftPct = 0.0f; // space after as % of line (0=use pt)
     // bullet
     bool hasBullet = false;
     bool bulletIsNone = false;
@@ -223,6 +275,10 @@ struct PptxParaProps {
     char* bulletCharStr = nullptr; // full utf-8 bullet char string
     bool bulletAutoNum = false;
     int bulletAutoNumStart = 1;
+    char* buFontName = nullptr;      // <a:buFont typeface="...">
+    COLORREF buColor = (COLORREF)-1; // <a:buClr>
+    float buSzPct = 0.0f;            // <a:buSzPct> bullet size as % of text (0=same)
+    float buSzPts = 0.0f;            // <a:buSzPts> bullet size in points (0=use pct)
     // default run properties for runs inside this paragraph
     float defFontSize = 0.0f;
     COLORREF defColor = (COLORREF)-1;
@@ -233,6 +289,7 @@ struct PptxParaProps {
     PptxParaProps() = default;
     ~PptxParaProps() {
         str::Free(bulletCharStr);
+        str::Free(buFontName);
         str::Free(defFont);
     }
 };
@@ -245,7 +302,9 @@ struct PptxBodyProps {
     i64 bIns = 45720; // bottom inset EMU
     int anchor = 0;   // 0=top, 1=center, 2=bottom
     bool wrap = true;
-    bool vert = false; // vertical text
+    bool vert = false;           // vertical text
+    float fontScale = 0.0f;      // normAutofit fontScale (0=no scaling, else % like 80.0)
+    float lnSpcReduction = 0.0f; // normAutofit lnSpcReduction (0=none, else % like 20.0)
 };
 
 struct PptxTextRun {
@@ -317,11 +376,13 @@ struct PptxShape {
     float phDefFontSize = 0.0f;   // default font size inherited from layout/master
     bool phDefBold = false;       // default bold inherited from layout/master
     Vec<PptxCustPath*> custPaths; // from <a:custGeom>
+    char* prstGeom = nullptr;     // preset geometry name ("roundRect", "ellipse", etc.)
 
     ~PptxShape() {
         DeleteVecMembers(paras);
         str::Free(imagePath);
         str::Free(phType);
+        str::Free(prstGeom);
         DeleteVecMembers(custPaths);
     }
 };
@@ -346,6 +407,7 @@ struct PptxDoc {
     Vec<PptxSlide*> slides;
     Props props;
     PptxTheme* theme = nullptr;
+    PptxTxStyles* txStyles = nullptr; // from slide master <p:txStyles>
 
     ~PptxDoc() {
         delete archive;
@@ -355,6 +417,7 @@ struct PptxDoc {
         }
         DeleteVecMembers(slides);
         delete theme;
+        delete txStyles;
     }
 };
 
@@ -545,6 +608,8 @@ static void ParseTheme(PptxDoc* doc, const char* themePath) {
     // Current color slot being filled
     COLORREF* curSlot = nullptr;
     bool inFontScheme = false;
+    bool inMajorFont = false;
+    bool inMinorFont = false;
 
     HtmlPullParser parser(data);
     HtmlToken* tok;
@@ -558,6 +623,14 @@ static void ParseTheme(PptxDoc* doc, const char* themePath) {
             }
             if (TagIs(tok, "fontScheme")) {
                 inFontScheme = false;
+                inMajorFont = false;
+                inMinorFont = false;
+            }
+            if (TagIs(tok, "majorFont")) {
+                inMajorFont = false;
+            }
+            if (TagIs(tok, "minorFont")) {
+                inMinorFont = false;
             }
             continue;
         }
@@ -594,6 +667,12 @@ static void ParseTheme(PptxDoc* doc, const char* themePath) {
             curSlot = &theme->folHlink;
         } else if (TagIs(tok, "fontScheme")) {
             inFontScheme = true;
+        } else if (inFontScheme && TagIs(tok, "majorFont")) {
+            inMajorFont = true;
+            inMinorFont = false;
+        } else if (inFontScheme && TagIs(tok, "minorFont")) {
+            inMinorFont = true;
+            inMajorFont = false;
         } else if (curSlot && TagIs(tok, "srgbClr")) {
             AttrInfo* v = tok->GetAttrByName("val");
             if (v) {
@@ -609,13 +688,10 @@ static void ParseTheme(PptxDoc* doc, const char* themePath) {
             curSlot = nullptr;
         } else if (inFontScheme && TagIs(tok, "latin")) {
             AttrInfo* tf = tok->GetAttrByName("typeface");
-            if (tf) {
-                // majorFont comes from <a:majorFont><a:latin>
-                // minorFont comes from <a:minorFont><a:latin>
-                // We can't distinguish here easily, but typically major is set first
-                if (!theme->majorFont) {
+            if (tf && tf->valLen > 0) {
+                if (inMajorFont && !theme->majorFont) {
                     theme->majorFont = str::Dup(tf->val, tf->valLen);
-                } else if (!theme->minorFont) {
+                } else if (inMinorFont && !theme->minorFont) {
                     theme->minorFont = str::Dup(tf->val, tf->valLen);
                 }
             }
@@ -794,6 +870,208 @@ static COLORREF ParseColorBlock(HtmlPullParser& parser, const PptxTheme* theme) 
     return ResolveColorCtx(ctx);
 }
 
+// Parse color inside a named parent element (e.g. <a:buClr>, <a:bgClr>).
+// Reads tokens until the matching end tag for parentEndTag.
+static COLORREF ParseColorElement(HtmlPullParser& parser, const char* parentEndTag, const PptxTheme* theme) {
+    ColorParseCtx ctx;
+    HtmlToken* tok;
+    while ((tok = parser.Next()) != nullptr) {
+        if (tok->IsError()) {
+            break;
+        }
+        if (tok->IsEndTag() && TagIs(tok, parentEndTag)) {
+            break;
+        }
+        bool isSelf = tok->IsEmptyElementEndTag();
+        bool isStart = tok->IsStartTag();
+        if (!isStart && !isSelf) {
+            continue;
+        }
+        if (TagIs(tok, "srgbClr")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v) {
+                ctx.color = ParseHexColor(v->val, v->valLen);
+            }
+            ctx.inSrgbClr = true;
+        } else if (TagIs(tok, "schemeClr")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v && theme) {
+                ctx.color = theme->GetSchemeColor(v->val, v->valLen);
+            }
+            ctx.inSchemeClr = true;
+        } else if (TagIs(tok, "sysClr")) {
+            AttrInfo* lc = tok->GetAttrByName("lastClr");
+            if (lc) {
+                ctx.color = ParseHexColor(lc->val, lc->valLen);
+            }
+        } else if (TagIs(tok, "tint")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            ctx.tint = (int)ParseAttrI64(v);
+        } else if (TagIs(tok, "shade")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            ctx.shade = (int)ParseAttrI64(v);
+        } else if (TagIs(tok, "lumMod")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            ctx.lumMod = (int)ParseAttrI64(v);
+        } else if (TagIs(tok, "lumOff")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            ctx.lumOff = (int)ParseAttrI64(v);
+        }
+    }
+    return ResolveColorCtx(ctx);
+}
+
+// Parse one txStyle section (titleStyle/bodyStyle/otherStyle) into level array.
+// Expects parser positioned just after the opening tag (e.g. <p:titleStyle>).
+static void ParseTxStyleLevels(HtmlPullParser& parser, const char* endTag, PptxLevelStyle* levels,
+                               const PptxTheme* theme) {
+    HtmlToken* tok;
+    int curLevel = -1;
+    bool inDefRPr = false;
+
+    while ((tok = parser.Next()) != nullptr) {
+        if (tok->IsError()) {
+            break;
+        }
+        if (tok->IsEndTag()) {
+            if (TagIs(tok, endTag)) {
+                break;
+            }
+            if (TagIs(tok, "defRPr")) {
+                inDefRPr = false;
+            }
+            // Check for lvlNpPr end
+            if (curLevel >= 0) {
+                char buf[16];
+                str::BufFmt(buf, sizeof(buf), "lvl%dpPr", curLevel + 1);
+                if (TagIs(tok, buf)) {
+                    curLevel = -1;
+                    inDefRPr = false;
+                }
+            }
+            continue;
+        }
+        bool isSelf = tok->IsEmptyElementEndTag();
+        bool isStart = tok->IsStartTag();
+        if (!isStart && !isSelf) {
+            continue;
+        }
+        // Match lvl1pPr through lvl9pPr
+        bool matched = false;
+        for (int i = 0; i < 9 && !matched; i++) {
+            char buf[16];
+            str::BufFmt(buf, sizeof(buf), "lvl%dpPr", i + 1);
+            if (TagIs(tok, buf)) {
+                curLevel = i;
+                matched = true;
+                AttrInfo* marL = tok->GetAttrByName("marL");
+                if (marL) {
+                    levels[i].marL = ParseAttrI64(marL);
+                }
+                AttrInfo* indent = tok->GetAttrByName("indent");
+                if (indent) {
+                    levels[i].indent = ParseAttrI64(indent);
+                }
+            }
+        }
+        if (matched) {
+            continue;
+        }
+
+        if (curLevel < 0) {
+            continue;
+        }
+        PptxLevelStyle& ls = levels[curLevel];
+
+        if (TagIs(tok, "buFont")) {
+            AttrInfo* tf = tok->GetAttrByName("typeface");
+            if (tf && tf->valLen > 0) {
+                str::Free(ls.bulletFont);
+                ls.bulletFont = str::Dup(tf->val, tf->valLen);
+            }
+        } else if (TagIs(tok, "buChar")) {
+            AttrInfo* ch = tok->GetAttrByName("char");
+            if (ch && ch->valLen > 0) {
+                ls.hasBullet = true;
+                ls.bulletIsNone = false;
+                str::Free(ls.bulletChar);
+                ls.bulletChar = str::Dup(ch->val, ch->valLen);
+            }
+        } else if (TagIs(tok, "buAutoNum")) {
+            ls.hasBullet = true;
+            ls.bulletIsNone = false;
+        } else if (TagIs(tok, "buNone")) {
+            ls.bulletIsNone = true;
+            ls.hasBullet = false;
+        } else if (TagIs(tok, "buSzPct")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v) {
+                ls.bulletSzPct = ParseAttrFloat(v) / 1000.0f; // val in 1/1000 %
+            }
+        } else if (TagIs(tok, "buClr")) {
+            if (!isSelf) {
+                COLORREF c = ParseColorElement(parser, "buClr", theme);
+                if (c != (COLORREF)-1) {
+                    ls.bulletColor = c;
+                }
+            }
+        } else if (TagIs(tok, "defRPr")) {
+            inDefRPr = true;
+            AttrInfo* sz = tok->GetAttrByName("sz");
+            if (sz) {
+                ls.fontSize = ParseAttrFloat(sz) / 100.0f;
+            }
+            AttrInfo* b = tok->GetAttrByName("b");
+            if (b) {
+                ls.bold = ParseAttrBool(b);
+            }
+            AttrInfo* i2 = tok->GetAttrByName("i");
+            if (i2) {
+                ls.italic = ParseAttrBool(i2);
+            }
+        } else if (inDefRPr && TagIs(tok, "solidFill")) {
+            COLORREF c = ParseColorBlock(parser, theme);
+            if (c != (COLORREF)-1) {
+                ls.color = c;
+            }
+        } else if (inDefRPr && TagIs(tok, "latin")) {
+            AttrInfo* tf = tok->GetAttrByName("typeface");
+            if (tf && tf->valLen > 0) {
+                str::Free(ls.fontName);
+                ls.fontName = str::Dup(tf->val, tf->valLen);
+            }
+        }
+    }
+}
+
+// Parse slide master XML and extract <p:txStyles>.
+static PptxTxStyles* ParseMasterTxStyles(MultiFormatArchive* archive, const char* masterPath, const PptxTheme* theme) {
+    ByteSlice data = archive->GetFileDataByName(masterPath);
+    if (!data) {
+        return nullptr;
+    }
+    auto* styles = new PptxTxStyles();
+    HtmlPullParser parser(data);
+    HtmlToken* tok;
+    while ((tok = parser.Next()) != nullptr) {
+        if (tok->IsError()) {
+            break;
+        }
+        if (!tok->IsStartTag()) {
+            continue;
+        }
+        if (TagIs(tok, "titleStyle")) {
+            ParseTxStyleLevels(parser, "titleStyle", styles->titleLevels, theme);
+        } else if (TagIs(tok, "bodyStyle")) {
+            ParseTxStyleLevels(parser, "bodyStyle", styles->bodyLevels, theme);
+        } else if (TagIs(tok, "otherStyle")) {
+            ParseTxStyleLevels(parser, "otherStyle", styles->otherLevels, theme);
+        }
+    }
+    data.Free();
+    return styles;
+}
+
 // ===== Run Properties Parser =====
 // Parses attributes and children of <a:rPr> into a PptxTextRun.
 static void ParseRunProps(HtmlToken* rprTok, HtmlPullParser& parser, PptxTextRun* run, const PptxTheme* theme) {
@@ -935,10 +1213,17 @@ static void ParseParaProps(HtmlToken* pprTok, HtmlPullParser& parser, PptxParaPr
                 if (inner->IsError() || (inner->IsEndTag() && TagIs(inner, "spcBef"))) {
                     break;
                 }
-                if ((inner->IsStartTag() || inner->IsEmptyElementEndTag()) && TagIs(inner, "spcPts")) {
-                    AttrInfo* v = inner->GetAttrByName("val");
-                    if (v) {
-                        props.spcBefPt = ParseAttrFloat(v) / 100.0f; // hundredths of a point
+                if (inner->IsStartTag() || inner->IsEmptyElementEndTag()) {
+                    if (TagIs(inner, "spcPts")) {
+                        AttrInfo* v = inner->GetAttrByName("val");
+                        if (v) {
+                            props.spcBefPt = ParseAttrFloat(v) / 100.0f; // hundredths of a point
+                        }
+                    } else if (TagIs(inner, "spcPct")) {
+                        AttrInfo* v = inner->GetAttrByName("val");
+                        if (v) {
+                            props.spcBefPct = ParseAttrFloat(v) / 1000.0f; // 1/1000 %
+                        }
                     }
                 }
             }
@@ -948,10 +1233,17 @@ static void ParseParaProps(HtmlToken* pprTok, HtmlPullParser& parser, PptxParaPr
                 if (inner->IsError() || (inner->IsEndTag() && TagIs(inner, "spcAft"))) {
                     break;
                 }
-                if ((inner->IsStartTag() || inner->IsEmptyElementEndTag()) && TagIs(inner, "spcPts")) {
-                    AttrInfo* v = inner->GetAttrByName("val");
-                    if (v) {
-                        props.spcAftPt = ParseAttrFloat(v) / 100.0f;
+                if (inner->IsStartTag() || inner->IsEmptyElementEndTag()) {
+                    if (TagIs(inner, "spcPts")) {
+                        AttrInfo* v = inner->GetAttrByName("val");
+                        if (v) {
+                            props.spcAftPt = ParseAttrFloat(v) / 100.0f;
+                        }
+                    } else if (TagIs(inner, "spcPct")) {
+                        AttrInfo* v = inner->GetAttrByName("val");
+                        if (v) {
+                            props.spcAftPct = ParseAttrFloat(v) / 1000.0f;
+                        }
                     }
                 }
             }
@@ -973,6 +1265,29 @@ static void ParseParaProps(HtmlToken* pprTok, HtmlPullParser& parser, PptxParaPr
             AttrInfo* startAt = tok->GetAttrByName("startAt");
             if (startAt) {
                 props.bulletAutoNumStart = (int)ParseAttrI64(startAt);
+            }
+        } else if (TagIs(tok, "buFont")) {
+            AttrInfo* tf = tok->GetAttrByName("typeface");
+            if (tf && tf->valLen > 0) {
+                str::Free(props.buFontName);
+                props.buFontName = str::Dup(tf->val, tf->valLen);
+            }
+        } else if (TagIs(tok, "buClr")) {
+            if (!isSelf) {
+                COLORREF c = ParseColorElement(parser, "buClr", theme);
+                if (c != (COLORREF)-1) {
+                    props.buColor = c;
+                }
+            }
+        } else if (TagIs(tok, "buSzPct")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v) {
+                props.buSzPct = ParseAttrFloat(v) / 1000.0f; // val in 1/1000 %
+            }
+        } else if (TagIs(tok, "buSzPts")) {
+            AttrInfo* v = tok->GetAttrByName("val");
+            if (v) {
+                props.buSzPts = ParseAttrFloat(v) / 100.0f; // val in hundredths of a point
             }
         } else if (TagIs(tok, "defRPr")) {
             // Default run properties for this paragraph
@@ -1056,12 +1371,22 @@ static void ParseBodyProps(HtmlToken* bodyTok, HtmlPullParser& parser, PptxBodyP
         bp.vert = vert->valLen > 0 && !str::EqNI(vert->val, "horz", vert->valLen);
     }
 
-    // Skip children (noAutofit, spAutoFit, normAutofit, scene3d, sp3d)
+    // Parse children for normAutofit fontScale
     if (!bodyTok->IsEmptyElementEndTag()) {
         HtmlToken* tok;
         while ((tok = parser.Next()) != nullptr) {
             if (tok->IsError() || (tok->IsEndTag() && TagIs(tok, "bodyPr"))) {
                 break;
+            }
+            if ((tok->IsStartTag() || tok->IsEmptyElementEndTag()) && TagIs(tok, "normAutofit")) {
+                AttrInfo* fs = tok->GetAttrByName("fontScale");
+                if (fs) {
+                    bp.fontScale = ParseAttrFloat(fs) / 1000.0f; // val in 1/1000 % → %
+                }
+                AttrInfo* lsr = tok->GetAttrByName("lnSpcReduction");
+                if (lsr) {
+                    bp.lnSpcReduction = ParseAttrFloat(lsr) / 1000.0f;
+                }
             }
         }
     }
@@ -1709,6 +2034,12 @@ static PptxSlide* ParseSlide(MultiFormatArchive* archive, const char* slideZipPa
             }
         } else if (curShape && inSpPr && TagIs(tok, "ln")) {
             ParseLineProps(tok, parser, curShape->borderWidth, curShape->borderColor, curShape->noBorder, theme);
+        } else if (curShape && inSpPr && TagIs(tok, "prstGeom")) {
+            AttrInfo* prst = tok->GetAttrByName("prst");
+            if (prst && prst->valLen > 0) {
+                str::Free(curShape->prstGeom);
+                curShape->prstGeom = str::Dup(prst->val, prst->valLen);
+            }
         } else if (curShape && inSpPr && TagIs(tok, "custGeom")) {
             inCustGeom = true;
         } else if (curShape && inCustGeom && TagIs(tok, "path")) {
@@ -1877,7 +2208,23 @@ static bool ParsePresentation(PptxDoc* doc) {
     }
     data.Free();
 
-    // 3. Build ordered slide paths from rIds
+    // 3. Parse slide master text styles (<p:txStyles>) for default text formatting
+    for (int i = 0; i < relPaths.Size(); i++) {
+        if (str::Find(relPaths[i], "slideMaster") && str::EndsWith(relPaths[i], ".xml")) {
+            AutoFreeStr masterPath;
+            if (!str::StartsWith(relPaths[i], "ppt/")) {
+                masterPath.Set(str::Format("ppt/%s", relPaths[i]));
+            } else {
+                masterPath.Set(str::Dup(relPaths[i]));
+            }
+            if (!doc->txStyles) {
+                doc->txStyles = ParseMasterTxStyles(doc->archive, masterPath.data, doc->theme);
+            }
+            break;
+        }
+    }
+
+    // 4. Build ordered slide paths from rIds
     for (char* rId : orderedRIds) {
         const char* target = LookupRId(relRIds, relPaths, rId);
         if (target) {
@@ -1975,8 +2322,8 @@ class EnginePptx : public EngineBase {
 
     // Resolve font name: handle "+mn-lt" / "+mj-lt" theme placeholders
     const char* ResolveFont(const char* fontName) const;
-    // Get effective color for a run (resolves -1 via para default, then dk1)
-    COLORREF EffectiveColor(const PptxTextRun* run, const PptxPara* para) const;
+    // Get effective color for a run (resolves -1 via para default, txStyles, then dk1)
+    COLORREF EffectiveColor(const PptxTextRun* run, const PptxPara* para, const PptxShape* shape = nullptr) const;
     // Get effective font size for a run (resolves 0 via para default, shape inherited, then 18pt)
     float EffectiveFontSize(const PptxTextRun* run, const PptxPara* para, const PptxShape* shape = nullptr) const;
 };
@@ -2015,12 +2362,20 @@ const char* EnginePptx::ResolveFont(const char* fontName) const {
     return fontName;
 }
 
-COLORREF EnginePptx::EffectiveColor(const PptxTextRun* run, const PptxPara* para) const {
+COLORREF EnginePptx::EffectiveColor(const PptxTextRun* run, const PptxPara* para, const PptxShape* shape) const {
     if (run->color != (COLORREF)-1) {
         return run->color;
     }
     if (para && para->props.defColor != (COLORREF)-1) {
         return para->props.defColor;
+    }
+    // Check master text styles for this placeholder type + level
+    if (doc->txStyles && shape && shape->phType) {
+        int lvl = para ? para->props.lvl : 0;
+        const PptxLevelStyle* ls = doc->txStyles->GetLevel(shape->phType, lvl);
+        if (ls && ls->color != (COLORREF)-1) {
+            return ls->color;
+        }
     }
     // Use theme dk1 (usually black/dark text)
     if (doc->theme) {
@@ -2038,6 +2393,14 @@ float EnginePptx::EffectiveFontSize(const PptxTextRun* run, const PptxPara* para
     }
     if (shape && shape->phDefFontSize > 0) {
         return shape->phDefFontSize;
+    }
+    // Check master text styles for this placeholder type + level
+    if (doc->txStyles && shape && shape->phType) {
+        int lvl = para ? para->props.lvl : 0;
+        const PptxLevelStyle* ls = doc->txStyles->GetLevel(shape->phType, lvl);
+        if (ls && ls->fontSize > 0) {
+            return ls->fontSize;
+        }
     }
     // Use sensible defaults based on placeholder type (matches PowerPoint defaults)
     if (shape && shape->phType) {
@@ -2241,6 +2604,10 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
         }
         Gdiplus::RectF shapeRect(sx, sy, sw, sh);
 
+        // Declare preset geometry state here so goto render_text doesn't skip initialization
+        bool hasPrstGeom = false;
+        Gdiplus::GraphicsPath prstPath;
+
         // Apply per-shape rotation / flip around the shape centre
         // Connectors handle flip manually via endpoint swap — skip matrix transform to avoid double-flip
         bool hasTransform = (shape->rot != 0 || shape->flipH || shape->flipV);
@@ -2363,11 +2730,87 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
             goto render_text;
         }
 
-        // Solid fill (rect)
+        // Preset geometry: build a GraphicsPath for the shape outline
+        hasPrstGeom = (shape->prstGeom != nullptr);
+        if (hasPrstGeom) {
+            const char* prst = shape->prstGeom;
+            if (str::EqI(prst, "ellipse") || str::EqI(prst, "oval")) {
+                prstPath.AddEllipse(shapeRect);
+            } else if (str::EqI(prst, "roundRect") || str::EqI(prst, "round2SameRect") ||
+                       str::EqI(prst, "snipRoundRect")) {
+                float radius = (sw < sh ? sw : sh) * 0.166f; // ~1/6 of smaller dimension
+                float d = radius * 2;
+                prstPath.AddArc(sx, sy, d, d, 180, 90);
+                prstPath.AddArc(sx + sw - d, sy, d, d, 270, 90);
+                prstPath.AddArc(sx + sw - d, sy + sh - d, d, d, 0, 90);
+                prstPath.AddArc(sx, sy + sh - d, d, d, 90, 90);
+                prstPath.CloseFigure();
+            } else if (str::EqI(prst, "triangle") || str::EqI(prst, "rtTriangle")) {
+                Gdiplus::PointF pts3[3] = {{sx + sw / 2, sy}, {sx + sw, sy + sh}, {sx, sy + sh}};
+                prstPath.AddPolygon(pts3, 3);
+            } else if (str::EqI(prst, "diamond")) {
+                Gdiplus::PointF pts4[4] = {
+                    {sx + sw / 2, sy}, {sx + sw, sy + sh / 2}, {sx + sw / 2, sy + sh}, {sx, sy + sh / 2}};
+                prstPath.AddPolygon(pts4, 4);
+            } else if (str::EqI(prst, "hexagon")) {
+                float qw = sw * 0.25f;
+                Gdiplus::PointF pts6[6] = {{sx + qw, sy},           {sx + sw - qw, sy}, {sx + sw, sy + sh / 2},
+                                           {sx + sw - qw, sy + sh}, {sx + qw, sy + sh}, {sx, sy + sh / 2}};
+                prstPath.AddPolygon(pts6, 6);
+            } else if (str::EqI(prst, "parallelogram")) {
+                float off = sw * 0.2f;
+                Gdiplus::PointF pts4p[4] = {{sx + off, sy}, {sx + sw, sy}, {sx + sw - off, sy + sh}, {sx, sy + sh}};
+                prstPath.AddPolygon(pts4p, 4);
+            } else if (str::EqI(prst, "trapezoid")) {
+                float off = sw * 0.2f;
+                Gdiplus::PointF pts4t[4] = {{sx + off, sy}, {sx + sw - off, sy}, {sx + sw, sy + sh}, {sx, sy + sh}};
+                prstPath.AddPolygon(pts4t, 4);
+            } else if (str::EqI(prst, "pentagon")) {
+                float mid = sw / 2;
+                Gdiplus::PointF pts5[5] = {{sx + mid, sy},
+                                           {sx + sw, sy + sh * 0.38f},
+                                           {sx + sw * 0.81f, sy + sh},
+                                           {sx + sw * 0.19f, sy + sh},
+                                           {sx, sy + sh * 0.38f}};
+                prstPath.AddPolygon(pts5, 5);
+            } else if (str::EqI(prst, "rightArrow") || str::EqI(prst, "leftArrow") || str::EqI(prst, "upArrow") ||
+                       str::EqI(prst, "downArrow")) {
+                // Simple arrow as a polygon
+                float qh = sh * 0.25f;
+                float hw = sw * 0.6f;
+                if (str::EqI(prst, "rightArrow")) {
+                    Gdiplus::PointF pa[7] = {{sx, sy + qh},          {sx + hw, sy + qh}, {sx + hw, sy},
+                                             {sx + sw, sy + sh / 2}, {sx + hw, sy + sh}, {sx + hw, sy + sh - qh},
+                                             {sx, sy + sh - qh}};
+                    prstPath.AddPolygon(pa, 7);
+                } else if (str::EqI(prst, "leftArrow")) {
+                    Gdiplus::PointF pa[7] = {{sx + sw, sy + qh},      {sx + sw - hw, sy + qh},
+                                             {sx + sw - hw, sy},      {sx, sy + sh / 2},
+                                             {sx + sw - hw, sy + sh}, {sx + sw - hw, sy + sh - qh},
+                                             {sx + sw, sy + sh - qh}};
+                    prstPath.AddPolygon(pa, 7);
+                } else {
+                    // up/down arrows — just use rect approximation
+                    prstPath.AddRectangle(shapeRect);
+                }
+            } else if (str::EqI(prst, "star5") || str::EqI(prst, "star4") || str::EqI(prst, "star6")) {
+                // Approximate as ellipse
+                prstPath.AddEllipse(shapeRect);
+            } else {
+                // Unknown preset — fall back to rectangle
+                hasPrstGeom = false;
+            }
+        }
+
+        // Solid fill
         if (shape->fillColor != (COLORREF)-1) {
             COLORREF fc = shape->fillColor;
             SolidBrush fillBrush(Color(GetRValue(fc), GetGValue(fc), GetBValue(fc)));
-            g.FillRectangle(&fillBrush, shapeRect);
+            if (hasPrstGeom) {
+                g.FillPath(&fillBrush, &prstPath);
+            } else {
+                g.FillRectangle(&fillBrush, shapeRect);
+            }
         }
 
         // Image — draw whenever imagePath is set (handles both <p:pic> and
@@ -2425,7 +2868,11 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
             }
             COLORREF bc = shape->borderColor;
             Pen bp(Color(GetRValue(bc), GetGValue(bc), GetBValue(bc)), bw);
-            g.DrawRectangle(&bp, shapeRect);
+            if (hasPrstGeom) {
+                g.DrawPath(&bp, &prstPath);
+            } else {
+                g.DrawRectangle(&bp, shapeRect);
+            }
         }
 
         if (shape->type != PptxShapeType::Text) {
@@ -2438,6 +2885,12 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
     render_text:
         // --- Text rendering ---
         const PptxBodyProps& bp = shape->bodyProps;
+
+        // Font scale from normAutofit (e.g. 80% means text shrinks to fit)
+        float fontScaleMul = 1.0f;
+        if (bp.fontScale > 0.0f && bp.fontScale < 100.0f) {
+            fontScaleMul = bp.fontScale / 100.0f;
+        }
 
         // Vertical text (vert="vert"): rotate 90° CW around shape center and swap w/h.
         // Only apply rotation for portrait shapes (taller than wide); landscape vert shapes
@@ -2483,7 +2936,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                     if (!run->text || !*run->text) {
                         continue;
                     }
-                    float fs = EffectiveFontSize(run, para, shape) * zoom;
+                    float fs = EffectiveFontSize(run, para, shape) * fontScaleMul * zoom;
                     int style = (run->bold || para->props.defBold ? FontStyleBold : FontStyleRegular) |
                                 (run->italic || para->props.defItalic ? FontStyleItalic : 0);
                     TempWStr fn = ToWStrTemp(ResolveFont(run->fontName));
@@ -2505,8 +2958,16 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                     lineHSp = paraLineH * lnMul2;
                 }
                 totalTextH += lineHSp;
-                totalTextH += para->props.spcBefPt * zoom * (96.0f / 72.0f);
-                totalTextH += para->props.spcAftPt * zoom * (96.0f / 72.0f);
+                if (para->props.spcBefPt > 0) {
+                    totalTextH += para->props.spcBefPt * zoom * (96.0f / 72.0f);
+                } else if (para->props.spcBefPct > 0) {
+                    totalTextH += lineHSp * para->props.spcBefPct / 100.0f;
+                }
+                if (para->props.spcAftPt > 0) {
+                    totalTextH += para->props.spcAftPt * zoom * (96.0f / 72.0f);
+                } else if (para->props.spcAftPct > 0) {
+                    totalTextH += lineHSp * para->props.spcAftPct / 100.0f;
+                }
             }
         }
 
@@ -2532,19 +2993,16 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
         for (PptxPara* para : shape->paras) {
             const PptxParaProps& pp = para->props;
 
-            // Space before paragraph
-            if (pp.spcBefPt > 0) {
-                lineY += pp.spcBefPt * zoom * (96.0f / 72.0f);
-            }
+            // spcBefPct is handled after paraLineH is computed (needs line height)
 
             // Compute line height for this paragraph
             float paraLineH = 0.0f;
-            float defFs = 12.0f * zoom;
+            float defFs = 12.0f * fontScaleMul * zoom;
             for (PptxTextRun* run : para->runs) {
                 if (!run->text || !*run->text) {
                     continue;
                 }
-                float fs = EffectiveFontSize(run, para, shape) * zoom;
+                float fs = EffectiveFontSize(run, para, shape) * fontScaleMul * zoom;
                 if (fs > defFs) {
                     defFs = fs;
                 }
@@ -2560,7 +3018,7 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
             }
             if (paraLineH == 0.0f) {
                 // Empty paragraph: use default/inherited size
-                float fs = (pp.defFontSize > 0 ? pp.defFontSize : 12.0f) * zoom;
+                float fs = (pp.defFontSize > 0 ? pp.defFontSize : 12.0f) * fontScaleMul * zoom;
                 TempWStr efn = ToWStrTemp(ResolveFont(nullptr));
                 Font ef(efn ? efn : L"Calibri", PtToPx(fs), FontStyleRegular, UnitPixel);
                 Gdiplus::RectF box;
@@ -2575,18 +3033,60 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 lineHSpaced = pp.lnSpcPts * zoom * (96.0f / 72.0f);
             } else {
                 float lnMul = (pp.lnSpcPct > 0) ? (pp.lnSpcPct / 100.0f) : 1.15f;
+                // Apply lnSpcReduction from normAutofit
+                if (bp.lnSpcReduction > 0.0f) {
+                    lnMul = lnMul * (1.0f - bp.lnSpcReduction / 100.0f);
+                    if (lnMul < 0.5f) {
+                        lnMul = 0.5f;
+                    }
+                }
                 lineHSpaced = paraLineH * lnMul;
+            }
+
+            // Space before paragraph (deferred to after lineH computation)
+            if (pp.spcBefPt > 0) {
+                lineY += pp.spcBefPt * zoom * (96.0f / 72.0f);
+            } else if (pp.spcBefPct > 0) {
+                lineY += lineHSpaced * pp.spcBefPct / 100.0f;
             }
 
             if (lineY >= shapeBottom) {
                 break;
             }
 
-            // Left margin / indent from para props
+            // Check txStyles for inherited bullet/margin if not explicitly set
+            const PptxLevelStyle* txLvl = nullptr;
+            if (doc->txStyles && shape->phType) {
+                txLvl = doc->txStyles->GetLevel(shape->phType, pp.lvl);
+            }
+
+            // Determine effective bullet state: explicit pPr > txStyles > default
+            bool effHasBullet = pp.hasBullet;
+            bool effBulletIsNone = pp.bulletIsNone;
+            const char* effBulletChar = pp.bulletCharStr;
+            const char* effBulletFont = pp.buFontName;
+            COLORREF effBulletColor = pp.buColor;
+            if (!pp.hasBullet && !pp.bulletIsNone && txLvl) {
+                effHasBullet = txLvl->hasBullet;
+                effBulletIsNone = txLvl->bulletIsNone;
+                if (!effBulletChar && txLvl->bulletChar) {
+                    effBulletChar = txLvl->bulletChar;
+                }
+                if (!effBulletFont && txLvl->bulletFont) {
+                    effBulletFont = txLvl->bulletFont;
+                }
+                if (effBulletColor == (COLORREF)-1 && txLvl->bulletColor != (COLORREF)-1) {
+                    effBulletColor = txLvl->bulletColor;
+                }
+            }
+
+            // Left margin / indent from para props, then txStyles
             float paraMarL;
             if (pp.marL >= 0) {
                 paraMarL = EmuToPx(pp.marL, zoom);
-            } else if (pp.hasBullet && !pp.bulletIsNone) {
+            } else if (txLvl && txLvl->marL >= 0) {
+                paraMarL = EmuToPx(txLvl->marL, zoom);
+            } else if (effHasBullet && !effBulletIsNone) {
                 // Default bullet indent ~0.5" per level (matches PowerPoint defaults)
                 i64 defaultMarL = (i64)(pp.lvl + 1) * 457200;
                 paraMarL = EmuToPx(defaultMarL, zoom);
@@ -2598,21 +3098,38 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
             float textStartX = tx + bulletIndent;
 
             // --- Draw bullet ---
-            if (pp.hasBullet && !pp.bulletIsNone) {
-                COLORREF bulletColor = (pp.defColor != (COLORREF)-1) ? pp.defColor : RGB(0, 0, 0);
-                if (doc->theme) {
-                    bulletColor = doc->theme->dk1;
+            if (effHasBullet && !effBulletIsNone) {
+                // Bullet color: explicit buClr > defColor > txStyle > theme dk1
+                COLORREF bulletColor;
+                if (effBulletColor != (COLORREF)-1) {
+                    bulletColor = effBulletColor;
+                } else if (pp.defColor != (COLORREF)-1) {
+                    bulletColor = pp.defColor;
+                } else {
+                    bulletColor = doc->theme ? doc->theme->dk1 : RGB(0, 0, 0);
                 }
+
+                // Bullet font size: buSzPts > buSzPct > txStyle buSzPct > same as text
                 float bFs = defFs;
-                TempWStr bfn = ToWStrTemp(ResolveFont(nullptr));
+                if (pp.buSzPts > 0) {
+                    bFs = pp.buSzPts * fontScaleMul * zoom;
+                } else if (pp.buSzPct > 0) {
+                    bFs = defFs * pp.buSzPct / 100.0f;
+                } else if (txLvl && txLvl->bulletSzPct > 0) {
+                    bFs = defFs * txLvl->bulletSzPct / 100.0f;
+                }
+
+                // Bullet font: explicit buFont > txStyle buFont > text font
+                const char* bFontU8 = effBulletFont ? ResolveFont(effBulletFont) : ResolveFont(nullptr);
+                TempWStr bfn = ToWStrTemp(bFontU8);
                 Font bFont(bfn ? bfn : L"Calibri", PtToPx(bFs), FontStyleRegular, UnitPixel);
                 SolidBrush bBrush(Color(GetRValue(bulletColor), GetGValue(bulletColor), GetBValue(bulletColor)));
 
                 char bulletBuf[32] = {0};
                 if (pp.bulletAutoNum) {
                     str::BufFmt(bulletBuf, sizeof(bulletBuf), "%d.", autoBulletNum++);
-                } else if (pp.bulletCharStr) {
-                    str::BufFmt(bulletBuf, sizeof(bulletBuf), "%s", pp.bulletCharStr);
+                } else if (effBulletChar) {
+                    str::BufFmt(bulletBuf, sizeof(bulletBuf), "%s", effBulletChar);
                 } else {
                     bulletBuf[0] = '\xe2';
                     bulletBuf[1] = '\x80';
@@ -2655,12 +3172,21 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 if (!run->text || !*run->text) {
                     continue;
                 }
-                float fs = EffectiveFontSize(run, para, shape) * zoom;
+                float fs = EffectiveFontSize(run, para, shape) * fontScaleMul * zoom;
                 int style = FontStyleRegular;
-                if (run->bold || pp.defBold || shape->phDefBold) {
+                // Bold: explicit run > para default > shape inherited > txStyles
+                bool isBold = run->bold || pp.defBold || shape->phDefBold;
+                if (!isBold && txLvl && txLvl->bold) {
+                    isBold = true;
+                }
+                if (isBold) {
                     style |= FontStyleBold;
                 }
-                if (run->italic || pp.defItalic) {
+                bool isItalic = run->italic || pp.defItalic;
+                if (!isItalic && txLvl && txLvl->italic) {
+                    isItalic = true;
+                }
+                if (isItalic) {
                     style |= FontStyleItalic;
                 }
                 if (run->underline) {
@@ -2669,12 +3195,20 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
                 if (run->strikethrough) {
                     style |= FontStyleStrikeout;
                 }
-                const char* fontNameU8 = ResolveFont(run->fontName);
+                // Font name: explicit run > para default > txStyles > theme
+                const char* fontNameU8 = run->fontName;
+                if (!fontNameU8 && pp.defFont) {
+                    fontNameU8 = pp.defFont;
+                }
+                if (!fontNameU8 && txLvl && txLvl->fontName) {
+                    fontNameU8 = txLvl->fontName;
+                }
+                fontNameU8 = ResolveFont(fontNameU8);
                 TempWStr fontNameW = ToWStrTemp(fontNameU8);
                 const wchar_t* fontW = fontNameW ? fontNameW : L"Calibri";
                 Font* font = new Font(fontW, PtToPx(fs), style, UnitPixel);
                 paraFonts.Append(font);
-                COLORREF rc = EffectiveColor(run, para);
+                COLORREF rc = EffectiveColor(run, para, shape);
 
                 TempWStr wtext = ToWStrTemp(run->text);
                 if (!wtext) {
@@ -2805,6 +3339,8 @@ RenderedBitmap* EnginePptx::RenderPage(RenderPageArgs& args) {
             // Space after paragraph
             if (pp.spcAftPt > 0) {
                 lineY += pp.spcAftPt * zoom * (96.0f / 72.0f);
+            } else if (pp.spcAftPct > 0) {
+                lineY += lineHSpaced * pp.spcAftPct / 100.0f;
             }
         }
 
